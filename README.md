@@ -36,6 +36,13 @@
 - 盘中无法获取场外基金实时净值，盘中信号使用对应 ETF / 指数日K（实时接口不稳定时降级为最近交易日）
 - 盘后可用基金净值做复盘校准（不用于倒推盘中决策）
 
+## 1.0 效果图（4张）
+
+![](assets/screenshots/screenshot-1.png)
+![](assets/screenshots/screenshot-2.png)
+![](assets/screenshots/screenshot-3.png)
+![](assets/screenshots/screenshot-4.png)
+
 ## 1.1 模块与数据流
 
 项目是“本地辅助决策仪表盘”，主要模块如下（均在项目根目录）：
