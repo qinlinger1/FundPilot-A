@@ -58,6 +58,32 @@ def _safe_call(fn: Callable, **kwargs) -> FetchResult:
         return FetchResult(ok=False, df=None, error=str(e))
 
 
+def _guess_cn_symbol_prefix(code: str) -> str | None:
+    c = str(code).strip().lower()
+    if not c:
+        return None
+    if c.startswith(("sh", "sz")):
+        return c[:2]
+    if len(c) == 6 and c.isdigit():
+        if c.startswith(("0", "3", "1")):
+            return "sz"
+        return "sh"
+    return None
+
+
+def _etf_sina_symbols(etf_code: str) -> list[str]:
+    c = str(etf_code).strip()
+    if not c:
+        return []
+    c_low = c.lower()
+    if c_low.startswith(("sh", "sz")):
+        return [c_low]
+    p = _guess_cn_symbol_prefix(c)
+    if p is None:
+        return [c]
+    return [f"{p}{c}"]
+
+
 def fetch_etf_daily(etf_code: str, start: date | None = None) -> FetchResult:
     try:
         import akshare as ak  # type: ignore
@@ -68,16 +94,21 @@ def fetch_etf_daily(etf_code: str, start: date | None = None) -> FetchResult:
     if start is not None:
         start_date = start.strftime("%Y%m%d")
 
-    candidates: list[tuple[Callable, dict]] = [
-        (
-            ak.fund_etf_hist_em,
-            {"symbol": etf_code, "period": "daily", "start_date": start_date, "end_date": None, "adjust": ""},
-        ),
-        (
-            ak.fund_etf_hist_sina,
-            {"symbol": etf_code},
-        ),
-    ]
+    candidates: list[tuple[Callable, dict]] = []
+
+    fn_em = getattr(ak, "fund_etf_hist_em", None)
+    if callable(fn_em):
+        candidates.append(
+            (
+                fn_em,
+                {"symbol": etf_code, "period": "daily", "start_date": start_date, "end_date": None, "adjust": ""},
+            )
+        )
+
+    fn_sina = getattr(ak, "fund_etf_hist_sina", None)
+    if callable(fn_sina):
+        for sym in _etf_sina_symbols(etf_code):
+            candidates.append((fn_sina, {"symbol": sym}))
 
     last_err = None
     for fn, kw in candidates:
@@ -99,10 +130,14 @@ def fetch_etf_spot(etf_code: str) -> FetchResult:
     except Exception as e:
         return FetchResult(ok=False, df=None, error=f"AkShare 导入失败: {e}")
 
-    candidates: list[tuple[Callable, dict]] = [
-        (ak.fund_etf_spot_em, {}),
-        (ak.fund_etf_spot_sina, {}),
-    ]
+    candidates: list[tuple[Callable, dict]] = []
+    fn_em = getattr(ak, "fund_etf_spot_em", None)
+    if callable(fn_em):
+        candidates.append((fn_em, {}))
+    fn_sina = getattr(ak, "fund_etf_spot_sina", None)
+    if callable(fn_sina):
+        candidates.append((fn_sina, {}))
+
     last_err = None
     for fn, kw in candidates:
         r = _safe_call(fn, **kw)
@@ -114,7 +149,12 @@ def fetch_etf_spot(etf_code: str) -> FetchResult:
         if code_col is None:
             last_err = "无法识别实时行情代码列"
             continue
-        row = df[df[code_col].astype(str) == str(etf_code)]
+        target = str(etf_code).strip().lower()
+        targets = {target}
+        for sym in _etf_sina_symbols(target):
+            targets.add(sym.lower())
+        s = df[code_col].astype(str).str.strip().str.lower()
+        row = df[s.isin(targets) | s.str.endswith(target)]
         if row.empty:
             last_err = "实时行情未找到该 ETF"
             continue
@@ -129,11 +169,16 @@ def fetch_index_daily(index_symbol: str, start: date | None = None) -> FetchResu
         return FetchResult(ok=False, df=None, error=f"AkShare 导入失败: {e}")
 
     start_str = start.strftime("%Y%m%d") if start is not None else None
-    candidates: list[tuple[Callable, dict]] = [
-        (ak.stock_zh_index_daily, {"symbol": index_symbol}),
-        (ak.stock_zh_index_daily_em, {"symbol": index_symbol}),
-        (ak.index_zh_a_hist, {"symbol": index_symbol, "period": "daily", "start_date": start_str, "end_date": None}),
-    ]
+    candidates: list[tuple[Callable, dict]] = []
+    fn1 = getattr(ak, "stock_zh_index_daily", None)
+    if callable(fn1):
+        candidates.append((fn1, {"symbol": index_symbol}))
+    fn2 = getattr(ak, "stock_zh_index_daily_em", None)
+    if callable(fn2):
+        candidates.append((fn2, {"symbol": index_symbol}))
+    fn3 = getattr(ak, "index_zh_a_hist", None)
+    if callable(fn3):
+        candidates.append((fn3, {"symbol": index_symbol, "period": "daily", "start_date": start_str, "end_date": None}))
 
     last_err = None
     for fn, kw in candidates:
@@ -193,4 +238,3 @@ def fetch_open_fund_nav(fund_code: str) -> FetchResult:
         return FetchResult(ok=True, df=out[["date", "nav", "pct_chg"]], error=None)
 
     return FetchResult(ok=False, df=None, error=last_err or "基金净值获取失败")
-

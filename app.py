@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 
 import config
-from data_fetcher import fetch_etf_daily, fetch_index_daily, fetch_open_fund_nav
+from data_fetcher import fetch_etf_daily, fetch_etf_spot, fetch_index_daily, fetch_open_fund_nav
 from db import connect, default_db_path, init_db, load_decisions, load_holdings, save_decision, upsert_holdings
 from decision import decide
 from portfolio import HOLDING_COLUMNS, compute_portfolio_state, fund_position_ratio
@@ -21,6 +21,12 @@ st.set_page_config(page_title=config.APP_TITLE, layout="wide")
 @st.cache_data(ttl=600)
 def cached_etf_daily(etf_code: str, start: date) -> tuple[pd.DataFrame | None, str | None]:
     r = fetch_etf_daily(etf_code, start=start)
+    return r.df, r.error
+
+
+@st.cache_data(ttl=20)
+def cached_etf_spot(etf_code: str) -> tuple[pd.DataFrame | None, str | None]:
+    r = fetch_etf_spot(etf_code)
     return r.df, r.error
 
 
@@ -85,6 +91,8 @@ def _style_ranking(df: pd.DataFrame):
                 "近20日涨幅": "{:.2%}",
                 "距离20日均线": "{:.2%}",
             }
+            ,
+            na_rep="-",
         )
     )
 
@@ -101,6 +109,47 @@ def _build_action_hint(is_holding: bool, buy_score: float | None, sell_score: fl
     if 70 <= b < 80:
         return "小买观察"
     return "不动"
+
+
+def _extract_spot_fields(spot_row: pd.DataFrame | None) -> dict:
+    if spot_row is None or spot_row.empty:
+        return {"ok": False}
+    r = spot_row.iloc[0].to_dict()
+
+    def pick(cols: list[str]):
+        for c in cols:
+            if c in r:
+                return r.get(c)
+        for k in r.keys():
+            if str(k).strip() in cols:
+                return r.get(k)
+        return None
+
+    price = pick(["最新价", "现价", "最新", "价格", "close", "最新价(元)"])
+    pct = pick(["涨跌幅", "涨跌幅(%)", "涨跌幅%", "pct_chg"])
+    amount = pick(["成交额", "成交额(元)", "amount"])
+
+    try:
+        price_f = float(price) if price not in (None, "") else None
+    except Exception:
+        price_f = None
+
+    try:
+        pct_f = float(pct) if pct not in (None, "") else None
+    except Exception:
+        pct_f = None
+
+    if pct_f is not None and abs(pct_f) > 1.5:
+        pct_f = pct_f / 100.0
+
+    try:
+        amount_f = float(amount) if amount not in (None, "") else None
+    except Exception:
+        amount_f = None
+
+    if price_f is None and pct_f is None and amount_f is None:
+        return {"ok": False}
+    return {"ok": True, "price": price_f, "pct_chg": pct_f, "amount": amount_f}
 
 
 def _render_final_decision_block(d) -> str:
@@ -136,6 +185,8 @@ def _render_final_decision_block(d) -> str:
 def main():
     st.title(config.APP_TITLE)
 
+    decision_placeholder = st.empty()
+
     if "fund_pool_df" not in st.session_state:
         st.session_state["fund_pool_df"] = _default_fund_pool_df()
 
@@ -159,6 +210,7 @@ def main():
         )
         start_days = st.slider("拉取历史数据天数", min_value=60, max_value=400, value=180, step=10)
         start_date = date.today() - timedelta(days=int(start_days))
+        use_spot = st.toggle("盘中尝试实时ETF行情(不稳定)", value=True)
         if st.button("清除缓存并刷新"):
             st.cache_data.clear()
             st.rerun()
@@ -195,25 +247,58 @@ def main():
 
     env = compute_market_env(idx_map)
 
-    overview_col1, overview_col2, overview_col3, overview_col4, overview_col5 = st.columns(5)
-    overview_col1.metric("当前时间", status.now.strftime("%Y-%m-%d %H:%M:%S"))
-    overview_col2.metric("交易日", "是" if status.is_trade_day else "否")
-    overview_col3.metric("交易阶段", status.phase)
-    overview_col4.metric("盘中", "是" if status.is_intraday else "否")
-    overview_col5.metric("终判区间(14:50-14:57)", "是" if status.is_final_window else "否")
+    head_col1, head_col2, head_col3 = st.columns([2.2, 1.6, 1.2])
 
-    money_col1, money_col2, money_col3 = st.columns(3)
-    money_col1.metric("当前总本金", format_currency(portfolio.principal))
-    money_col2.metric("可用现金(估算)", format_currency(portfolio.cash))
-    money_col3.metric("持仓市值(估算)", format_currency(portfolio.holdings_value))
+    with head_col1:
+        st.subheader("总览区")
+        s1, s2 = st.columns([1.4, 1.0])
+        s1.metric("北京时间", status.now.strftime("%Y-%m-%d %H:%M:%S"))
+        s2.metric("交易阶段", status.phase)
+        s3, s4, s5 = st.columns(3)
+        s3.metric("交易日(今日)", "是" if status.is_trade_day else "否")
+        s4.metric("盘中", "是" if status.is_intraday else "否")
+        s5.metric("终判(14:50-14:57)", "是" if status.is_final_window else "否")
+        if env.systemic_risk:
+            st.error("风险：系统性风险偏高（优先防守）")
+        elif not env.allow_attack:
+            st.warning("风险：大盘环境一般（默认谨慎）")
+        else:
+            st.success("风险：大盘环境允许进攻（仍需看个体评分）")
+
+    with head_col2:
+        st.subheader("资金与持仓")
+        m1, m2 = st.columns(2)
+        m1.metric("当前总本金", format_currency(portfolio.principal))
+        m2.metric("可用现金(估算)", format_currency(portfolio.cash))
+        st.metric("持仓市值(估算)", format_currency(portfolio.holdings_value))
+        st.caption("现金=本金-持仓市值（v1估算，不含申购/赎回在途资金）。")
+
+        with st.expander("当前基金持仓明细", expanded=False):
+            if portfolio.holdings.empty:
+                st.info("暂无持仓（因此现金=本金属于正常现象）")
+            else:
+                show_h = portfolio.holdings.copy()
+                show_h = show_h.rename(
+                    columns={
+                        "fund_name": "基金名称",
+                        "track": "赛道",
+                        "position_value": "持仓金额(元)",
+                        "pnl": "盈亏比例",
+                        "allow_add": "允许加仓",
+                        "last_add_date": "上次加仓日期",
+                    }
+                )
+                keep = ["基金名称", "赛道", "持仓金额(元)", "盈亏比例", "允许加仓", "上次加仓日期"]
+                keep = [c for c in keep if c in show_h.columns]
+                st.dataframe(show_h[keep], use_container_width=True, height=180)
+
+    with head_col3:
+        st.subheader("今日最终动作")
+        st.caption("每次只输出一个主动作。")
+        decision_placeholder.info("正在计算中…")
 
     if idx_errors:
         st.warning("部分大盘指数数据获取失败：" + "；".join([f"{k}:{v}" for k, v in idx_errors.items()]))
-
-    if env.systemic_risk:
-        st.error("风险提示：检测到系统性风险偏高，优先防守，默认不主动加仓。")
-    elif not env.allow_attack:
-        st.warning("大盘环境一般，默认谨慎。")
 
     st.divider()
 
@@ -246,6 +331,8 @@ def main():
                     "fund_name": fund_name,
                     "track": track,
                     "etf_code": etf_code,
+                    "信号日期": None,
+                    "口径": "失败",
                     "近5日涨幅": None,
                     "近10日涨幅": None,
                     "近20日涨幅": None,
@@ -259,6 +346,29 @@ def main():
             continue
 
         ind = compute_indicators(etf_df, bench_df)
+        signal_date = (
+            pd.to_datetime(etf_df["date"], errors="coerce").dropna().max().date()
+            if "date" in etf_df.columns and not etf_df.empty
+            else None
+        )
+        basis = "日K"
+
+        spot_used = False
+        if use_spot and status.is_intraday:
+            spot_df, _ = cached_etf_spot(etf_code)
+            spot = _extract_spot_fields(spot_df)
+            if spot.get("ok"):
+                if spot.get("price") is not None:
+                    ind["close"] = float(spot["price"])
+                    if ind.get("ma20") is not None:
+                        ind["dist_ma20"] = float(ind["close"] / ind["ma20"] - 1.0)
+                        ind["above_ma20"] = ind["close"] >= ind["ma20"]
+                if spot.get("pct_chg") is not None:
+                    ind["pct_chg"] = float(spot["pct_chg"])
+                if spot.get("amount") is not None:
+                    ind["amount"] = float(spot["amount"])
+                spot_used = True
+                basis = "实时"
 
         holding_ratio = fund_position_ratio(portfolio, fund_name)
         holding_pnl = None
@@ -281,6 +391,8 @@ def main():
                 "fund_name": fund_name,
                 "track": track,
                 "etf_code": etf_code,
+                "信号日期": signal_date,
+                "口径": basis,
                 "近5日涨幅": ind.get("etf_ret_5"),
                 "近10日涨幅": ind.get("etf_ret_10"),
                 "近20日涨幅": ind.get("etf_ret_20"),
@@ -300,6 +412,9 @@ def main():
             "track": track,
             "fund_code": fund_code,
             "etf_code": etf_code,
+            "signal_date": signal_date,
+            "basis": basis,
+            "spot_used": spot_used,
         }
 
     ranking_df = pd.DataFrame(ranking_rows)
@@ -307,6 +422,8 @@ def main():
         "fund_name",
         "track",
         "etf_code",
+        "信号日期",
+        "口径",
         "近5日涨幅",
         "近10日涨幅",
         "近20日涨幅",
@@ -331,6 +448,8 @@ def main():
         ind = info["ind"]
         buy_breakdown = info["buy_breakdown"]
         sell_breakdown = info["sell_breakdown"]
+        signal_date = info.get("signal_date")
+        basis = info.get("basis")
 
         ddf = etf_df.copy()
         ddf = ddf.dropna(subset=["date", "close"]).copy()
@@ -338,11 +457,13 @@ def main():
         chart_df = ddf.set_index("date")[["close", "ma20"]].dropna(how="all")
         st.line_chart(chart_df, height=260)
 
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("近5日涨幅", format_pct(ind.get("etf_ret_5")))
         m2.metric("近10日涨幅", format_pct(ind.get("etf_ret_10")))
         m3.metric("近20日涨幅", format_pct(ind.get("etf_ret_20")))
         m4.metric("距离20日均线", format_pct(ind.get("dist_ma20")))
+        m5.metric("信号口径", str(basis or "-"))
+        st.caption(f"信号日期：{signal_date or '-'}（口径=实时时，涨跌幅/最新价优先用实时行情，其余指标仍基于历史日K）")
 
         c1, c2 = st.columns(2)
         with c1:
@@ -396,6 +517,7 @@ def main():
 
     d = decide(status=status, env=env, ranking_df=ranking_for_decision, portfolio=portfolio, now=status.now)
     st.code(_render_final_decision_block(d), language="text")
+    decision_placeholder.success(f"动作：{d.action} ｜ 对象：{d.target or '-'} ｜ 金额/比例：{d.amount_or_ratio}")
 
     save_col1, save_col2 = st.columns([1, 4])
     with save_col1:
@@ -458,4 +580,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
