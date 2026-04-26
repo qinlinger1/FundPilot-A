@@ -10,6 +10,7 @@
 
 - QQ：50580349
 - WeChat：GameMike1920
+- Gmail：77778888robert@gmail.com
 
 ## 免责声明
 
