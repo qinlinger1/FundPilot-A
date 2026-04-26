@@ -1,0 +1,4 @@
+streamlit>=1.33
+akshare>=1.12
+pandas>=2.0
+numpy>=1.24

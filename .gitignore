@@ -1,0 +1,10 @@
+/.venv/
+/data/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+.streamlit/
+*.db
+*.sqlite
